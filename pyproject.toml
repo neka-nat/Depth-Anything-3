@@ -38,6 +38,7 @@ dependencies = [
     "uvicorn",
     "moviepy==1.0.3",
     "typer>=0.9.0",
+    "rerun-sdk>=0.23.1",
 ]
 
 [project.optional-dependencies]
