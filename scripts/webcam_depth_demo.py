@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Run Depth Anything 3 on webcam frames and visualize predicted depth."""
 
 from __future__ import annotations
