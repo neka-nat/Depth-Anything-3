@@ -40,6 +40,9 @@ dependencies = [
     "typer>=0.9.0",
     "pycolmap",
     "rerun-sdk>=0.23.1",
+    "faiss-gpu-cu12>=1.12.0",
+    "pypose>=0.7.3",
+    "numba>=0.60.0",
 ]
 
 [project.optional-dependencies]

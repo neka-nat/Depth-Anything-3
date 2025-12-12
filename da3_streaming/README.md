@@ -105,6 +105,34 @@ python npz_output_process.py --npz_folder ${OUTPUT_DIR}/results_output --pose_fi
 
 **Note on Space Requirements**: Please ensure your machine has sufficient disk space before running the code for `DA3-Streaming`. When finishing, the code will delete these intermediate results to prevent excessive disk usage.
 
+---
+
+## Webcam + Rerun (Real-time)
+
+This repo also includes a simple live demo that streams a point cloud and camera trajectory
+to the Rerun viewer.
+
+### Install (optional)
+
+```bash
+pip install rerun-sdk
+```
+
+### Run
+
+From the repo root (after `pip install -e .`):
+
+```bash
+python da3_streaming/da3_webcam_rerun.py --spawn
+```
+
+Useful knobs:
+
+- `--camera-index 0` (select webcam)
+- `--max-edge 640` (reduce latency)
+- `--stride 6` (fewer points)
+- `--no-vo` (disable VO and keep pose fixed)
+
 ## Experiment Results
 
 We conducted some additional experiments to compare the performance differences among different architectures. Below is the comparison of `ATE RMSE [m]` on KITTI Odometry between `DA3-Streaming`, `VGGT-Long` and `Pi-Long`. All methods are evaluated with overlap equal to half chunk size, comparable resolution (~500px-width), and loop closure with similarity threshold 0.85.
