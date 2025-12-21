@@ -13,7 +13,6 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 import torch
-from pylekiwi.nodes import ClientControllerNode
 from safetensors.torch import load_file
 
 from depth_anything_3.api import DepthAnything3
@@ -144,6 +143,29 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=200_000,
         help="Cap accumulated map points to this size.",
+    )
+    parser.add_argument(
+        "--map2d-enable",
+        action="store_true",
+        help="Enable 2D point map projection (Z-band onto XY plane).",
+    )
+    parser.add_argument(
+        "--map2d-z-min",
+        type=float,
+        default=0.0,
+        help="Lower bound for Z-axis band used in 2D projection.",
+    )
+    parser.add_argument(
+        "--map2d-z-max",
+        type=float,
+        default=0.3,
+        help="Upper bound for Z-axis band used in 2D projection.",
+    )
+    parser.add_argument(
+        "--map2d-max-points",
+        type=int,
+        default=100_000,
+        help="Cap accumulated 2D map points to this size.",
     )
 
     # Chunk-streaming controls (DA3-style streaming)
@@ -282,6 +304,22 @@ def apply_base_transform(points: np.ndarray, base_R: np.ndarray, base_t: np.ndar
     if points.size == 0:
         return points.astype(np.float32, copy=False)
     return (base_R @ points.T).T + base_t[None, :]
+
+
+def project_points_xy(
+    points: np.ndarray, colors: np.ndarray, z_min: float, z_max: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    if points.size == 0:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+    if points.shape[0] != colors.shape[0]:
+        raise ValueError("points and colors must have the same length.")
+    z = points[:, 2]
+    mask = (z >= float(z_min)) & (z <= float(z_max))
+    if not np.any(mask):
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
+    pts2d = points[mask][:, :2].astype(np.float32, copy=False)
+    cols = colors[mask].astype(np.uint8, copy=False)
+    return pts2d, cols
 
 
 def decode_payload(payload: bytes) -> np.ndarray:
@@ -843,7 +881,6 @@ def load_da3_model(args: argparse.Namespace, device: torch.device) -> DepthAnyth
 def main() -> None:
     args = parse_args()
     rr = _require_rerun()
-    controller = ClientControllerNode()
 
     if args.overlap is None:
         args.overlap = max(0, int(args.chunk_size) // 2)
@@ -865,6 +902,21 @@ def main() -> None:
             rr.spawn()
         except Exception:
             pass
+    if args.map2d_enable:
+        try:
+            import rerun.blueprint as rrb  # type: ignore
+
+            rr.send_blueprint(
+                rrb.Blueprint(
+                    rrb.Horizontal(
+                        rrb.Spatial3DView(origin="world"),
+                        rrb.Spatial2DView(origin="map2d"),
+                    ),
+                    collapse_panels=True,
+                )
+            )
+        except Exception:
+            pass
 
     try:
         rr.log("world", rr.ViewCoordinates.RDF, timeless=True)
@@ -884,6 +936,11 @@ def main() -> None:
     reservoir_cols = np.zeros((int(args.max_points), 3), dtype=np.uint8)
     reservoir_filled = 0
     reservoir_seen = 0
+
+    map2d_pts = np.zeros((int(args.map2d_max_points), 2), dtype=np.float32)
+    map2d_cols = np.zeros((int(args.map2d_max_points), 3), dtype=np.uint8)
+    map2d_filled = 0
+    map2d_seen = 0
 
     frame_buf: list[np.ndarray] = []
     id_buf: list[int] = []
@@ -976,6 +1033,19 @@ def main() -> None:
                     filled=reservoir_filled,
                     seen=reservoir_seen,
                 )
+                if args.map2d_enable:
+                    pts2d, _cols2d = project_points_xy(
+                        pts_world, cols, args.map2d_z_min, args.map2d_z_max
+                    )
+                    cols2d = np.full((pts2d.shape[0], 3), 255, dtype=np.uint8)
+                    map2d_filled, map2d_seen = reservoir_update(
+                        pts2d,
+                        cols2d,
+                        reservoir_pts=map2d_pts,
+                        reservoir_cols=map2d_cols,
+                        filled=map2d_filled,
+                        seen=map2d_seen,
+                    )
 
                 cam_pos_base = apply_base_transform(c2w[:3, 3][None, :], base_R, base_t)[0]
                 cam_positions.append(cam_pos_base)
@@ -998,6 +1068,18 @@ def main() -> None:
                 )
                 rr.log("world/points", rr.Points3D(pts_view, colors=col_view))
                 rr.log("world/camera_path", rr.LineStrips3D([cam_path]))
+                if args.map2d_enable:
+                    pts2d_view = (
+                        map2d_pts[:map2d_filled]
+                        if map2d_filled < map2d_pts.shape[0]
+                        else map2d_pts
+                    )
+                    cols2d_view = (
+                        map2d_cols[:map2d_filled]
+                        if map2d_filled < map2d_cols.shape[0]
+                        else map2d_cols
+                    )
+                    rr.log("map2d/points", rr.Points2D(pts2d_view, colors=cols2d_view))
 
                 try:
                     rr.log("world/rgb", rr.Image(rgb_u8))
@@ -1117,6 +1199,19 @@ def main() -> None:
                     filled=reservoir_filled,
                     seen=reservoir_seen,
                 )
+                if args.map2d_enable:
+                    pts2d, _cols2d = project_points_xy(
+                        pts_global, cols, args.map2d_z_min, args.map2d_z_max
+                    )
+                    cols2d = np.full((pts2d.shape[0], 3), 255, dtype=np.uint8)
+                    map2d_filled, map2d_seen = reservoir_update(
+                        pts2d,
+                        cols2d,
+                        reservoir_pts=map2d_pts,
+                        reservoir_cols=map2d_cols,
+                        filled=map2d_filled,
+                        seen=map2d_seen,
+                    )
 
                 cam_pos_chunk = c2w_chunk[:3, 3].astype(np.float32)
                 cam_pos_global = apply_sim3(cam_pos_chunk[None, :], s_cum, R_cum, t_cum)[0]
@@ -1141,6 +1236,18 @@ def main() -> None:
                 )
                 rr.log("world/points", rr.Points3D(pts_view, colors=col_view))
                 rr.log("world/camera_path", rr.LineStrips3D([cam_path]))
+                if args.map2d_enable:
+                    pts2d_view = (
+                        map2d_pts[:map2d_filled]
+                        if map2d_filled < map2d_pts.shape[0]
+                        else map2d_pts
+                    )
+                    cols2d_view = (
+                        map2d_cols[:map2d_filled]
+                        if map2d_filled < map2d_cols.shape[0]
+                        else map2d_cols
+                    )
+                    rr.log("map2d/points", rr.Points2D(pts2d_view, colors=cols2d_view))
 
                 try:
                     rr.log("world/rgb", rr.Image(rgb_u8))
