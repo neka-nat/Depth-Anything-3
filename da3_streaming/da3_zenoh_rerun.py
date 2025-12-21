@@ -12,12 +12,15 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
+import open3d as o3d
 import torch
+from PIL import Image
+from dotenv import load_dotenv
 from safetensors.torch import load_file
-
 from depth_anything_3.api import DepthAnything3
 from loop_utils.config_utils import load_config
 
+load_dotenv()
 
 def _require_rerun():
     try:
@@ -41,6 +44,18 @@ def _require_zenoh():
         )
         raise
     return zenoh
+
+
+def _require_vlm_recog():
+    try:
+        from vlm_recog import detect  # type: ignore
+    except ModuleNotFoundError:
+        print(
+            "[ERROR] vlm-recog is not installed. Install it with: pip install vlm-recog",
+            file=sys.stderr,
+        )
+        raise
+    return lambda x, prompt: detect(x, [prompt])
 
 
 def parse_args() -> argparse.Namespace:
@@ -166,6 +181,25 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=100_000,
         help="Cap accumulated 2D map points to this size.",
+    )
+
+    # Detection controls
+    parser.add_argument(
+        "--detect-enable",
+        action="store_true",
+        help="Enable object detection projection into 3D.",
+    )
+    parser.add_argument(
+        "--detect-stride",
+        type=int,
+        default=4,
+        help="Pixel stride for sampling detection regions.",
+    )
+    parser.add_argument(
+        "--detect-max-points",
+        type=int,
+        default=5_000,
+        help="Max points per detection to project.",
     )
 
     # Chunk-streaming controls (DA3-style streaming)
@@ -328,7 +362,7 @@ def decode_payload(payload: bytes) -> np.ndarray:
     return image
 
 
-class ZenohImageReceiver:
+class ZenohConnection:
     def __init__(self, key_expr: str, config_path: str | None):
         zenoh = _require_zenoh()
         if config_path:
@@ -344,6 +378,16 @@ class ZenohImageReceiver:
         self._event = threading.Event()
         self._payload: Optional[bytes] = None
         self._sub = self._session.declare_subscriber(key_expr, self._on_sample)
+        self._sub_prompt = self._session.declare_subscriber("prompt", self._on_prompt)
+        self._prompt = None
+        self._pub_current_pos = self._session.declare_publisher("current_pos")
+        self._pub_obj_points = self._session.declare_publisher("obj_points")
+
+    def publish_obj_points(self, obj_points: np.ndarray):
+        self._pub_obj_points.put(obj_points.tobytes())
+
+    def publish_current_pos(self, current_pos: np.ndarray):
+        self._pub_current_pos.put(current_pos.tobytes())
 
     def _on_sample(self, sample):
         payload = sample.payload
@@ -353,6 +397,12 @@ class ZenohImageReceiver:
             self._payload = payload
             self._event.set()
 
+    def _on_prompt(self, sample):
+        prompt = sample.payload.to_string()
+        print(f"Received prompt: {prompt}")
+        with self._lock:
+            self._prompt = prompt
+
     def pop_latest(self, timeout: float) -> Optional[bytes]:
         if not self._event.wait(timeout):
             return None
@@ -361,6 +411,12 @@ class ZenohImageReceiver:
             self._payload = None
             self._event.clear()
         return payload
+
+    def pop_prompt(self) -> Optional[str]:
+        with self._lock:
+            prompt = self._prompt
+            self._prompt = None
+        return prompt
 
     def close(self) -> None:
         try:
@@ -413,6 +469,34 @@ def backproject_world_points_from_w2c(
 
     Xw = (R.T @ (Xc - t[:, None])).T
     return Xw.astype(np.float32, copy=False)
+
+
+def backproject_world_points_from_c2w(
+    depth: np.ndarray, K: np.ndarray, c2w: np.ndarray, us: np.ndarray, vs: np.ndarray
+) -> np.ndarray:
+    if depth.ndim != 2:
+        raise ValueError(f"depth must be (H,W), got {depth.shape}")
+    if K.shape != (3, 3):
+        raise ValueError(f"K must be (3,3), got {K.shape}")
+    if us.shape != vs.shape:
+        raise ValueError("us and vs must have the same shape.")
+
+    z = depth[vs, us].astype(np.float32, copy=False)
+    fx = float(K[0, 0])
+    fy = float(K[1, 1])
+    cx = float(K[0, 2])
+    cy = float(K[1, 2])
+
+    us_f = us.astype(np.float32)
+    vs_f = vs.astype(np.float32)
+    x = (us_f - cx) * z / fx
+    y = (vs_f - cy) * z / fy
+    pts_cam = np.stack([x, y, z], axis=-1)
+
+    R = c2w[:3, :3].astype(np.float32)
+    t = c2w[:3, 3].astype(np.float32)
+    pts_world = (R @ pts_cam.T).T + t[None, :]
+    return pts_world.astype(np.float32, copy=False)
 
 
 def apply_sim3(points: np.ndarray, s: float, R: np.ndarray, t: np.ndarray) -> np.ndarray:
@@ -864,6 +948,125 @@ def reservoir_update(
     return filled, seen
 
 
+def _clip_box_xyxy(box: Tuple[int, int, int, int], h: int, w: int) -> Tuple[int, int, int, int] | None:
+    x1, y1, x2, y2 = map(int, box)
+    x1, x2 = sorted((x1, x2))
+    y1, y2 = sorted((y1, y2))
+    x1 = int(np.clip(x1, 0, w - 1))
+    y1 = int(np.clip(y1, 0, h - 1))
+    x2 = int(np.clip(x2, 0, w))
+    y2 = int(np.clip(y2, 0, h))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def _sample_pixels_from_detection(
+    det, h: int, w: int, stride: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    box = _clip_box_xyxy(det.box_2d, h, w)
+    if box is None:
+        return np.zeros((0,), dtype=np.int32), np.zeros((0,), dtype=np.int32)
+    x1, y1, x2, y2 = box
+    if det.segmentation_mask is not None:
+        mask = det.segmentation_mask
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        mask = mask > 100
+        mask_full = np.zeros((h, w), dtype=bool)
+        mask_full[y1:y2, x1:x2] = mask
+        vs, us = np.nonzero(mask_full)
+        if stride > 1 and vs.size > 0:
+            vs = vs[::stride]
+            us = us[::stride]
+        return us.astype(np.int32, copy=False), vs.astype(np.int32, copy=False)
+
+    ys, xs = np.mgrid[y1:y2:stride, x1:x2:stride]
+    return xs.reshape(-1).astype(np.int32), ys.reshape(-1).astype(np.int32)
+
+
+def detection_points_to_world(
+    det,
+    depth: np.ndarray,
+    K: np.ndarray,
+    c2w: np.ndarray,
+    *,
+    stride: int,
+    min_depth: float,
+    max_depth: float,
+    max_points: int,
+) -> np.ndarray:
+    h, w = depth.shape
+    us, vs = _sample_pixels_from_detection(det, h, w, stride)
+    if us.size == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    z = depth[vs, us].astype(np.float32)
+    valid = np.isfinite(z) & (z > float(min_depth)) & (z < float(max_depth))
+    if not np.any(valid):
+        return np.zeros((0, 3), dtype=np.float32)
+    us = us[valid]
+    vs = vs[valid]
+
+    pts_world = backproject_world_points_from_c2w(depth, K, c2w, us, vs)
+    max_points = int(max_points)
+    if max_points > 0 and pts_world.shape[0] > max_points:
+        sel = np.random.choice(pts_world.shape[0], max_points, replace=False)
+        pts_world = pts_world[sel]
+    return pts_world.astype(np.float32, copy=False)
+
+
+def detect_objects_to_world(
+    detect_fn,
+    rgb_u8: np.ndarray,
+    depth: np.ndarray,
+    K: np.ndarray,
+    c2w: np.ndarray,
+    prompt: str,
+    *,
+    stride: int,
+    min_depth: float,
+    max_depth: float,
+    max_points: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    from vlm_recog.visualization import draw_detections
+    pil_image = Image.fromarray(rgb_u8)
+    dets = detect_fn(pil_image, prompt)
+    output_image = draw_detections(pil_image, dets)
+    output_image.save("output_image.png")
+    if not dets:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+
+    all_pts = []
+    centers = []
+    for det in dets:
+        pts = detection_points_to_world(
+            det,
+            depth,
+            K,
+            c2w,
+            stride=stride,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            max_points=max_points,
+        )
+        if pts.size == 0:
+            continue
+        # radius_outlier_removal
+        points, _ = o3d.geometry.PointCloud(
+            points=o3d.utility.Vector3dVector(pts)
+        ).remove_radius_outlier(radius=0.05, nb_points=5)
+        all_pts.append(np.asarray(points.points))
+        centers.append(np.mean(pts, axis=0))
+
+    if not all_pts:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.float32)
+
+    pts_all = np.concatenate(all_pts, axis=0).astype(np.float32, copy=False)
+    centers_arr = np.asarray(centers, dtype=np.float32)
+    return pts_all, centers_arr
+
+
 def load_da3_model(args: argparse.Namespace, device: torch.device) -> DepthAnything3:
     if args.model_id:
         model = DepthAnything3.from_pretrained(args.model_id)
@@ -895,6 +1098,7 @@ def main() -> None:
     device = pick_device(args.device)
     print(f"[INFO] Loading model on {device}...", file=sys.stderr)
     model = load_da3_model(args, device)
+    detect_fn = _require_vlm_recog() if args.detect_enable else None
 
     rr.init("da3_zenoh_stream")
     if args.spawn:
@@ -923,7 +1127,7 @@ def main() -> None:
     except Exception:
         pass
 
-    receiver = ZenohImageReceiver(args.zenoh_key, args.zenoh_config)
+    connection = ZenohConnection(args.zenoh_key, args.zenoh_config)
     print(f"[INFO] Listening on zenoh key: {args.zenoh_key}", file=sys.stderr)
 
     prev_gray = None
@@ -950,7 +1154,7 @@ def main() -> None:
     frame_idx = 0
     try:
         while True:
-            payload = receiver.pop_latest(timeout=float(args.wait_timeout))
+            payload = connection.pop_latest(timeout=float(args.wait_timeout))
             if payload is None:
                 time.sleep(float(args.idle_sleep))
                 continue
@@ -1012,6 +1216,25 @@ def main() -> None:
                     )
                     c2w = vo.c2w
 
+                det_points = np.zeros((0, 3), dtype=np.float32)
+                det_centers = np.zeros((0, 3), dtype=np.float32)
+                prompt = connection.pop_prompt()
+                if detect_fn is not None and prompt is not None:
+                    det_points, det_centers = detect_objects_to_world(
+                        detect_fn,
+                        rgb_u8,
+                        depth,
+                        K,
+                        c2w,
+                        prompt,
+                        stride=int(args.detect_stride),
+                        min_depth=float(args.min_depth),
+                        max_depth=float(args.max_depth),
+                        max_points=int(args.detect_max_points),
+                    )
+                    det_points = apply_base_transform(det_points, base_R, base_t)
+                    det_centers = apply_base_transform(det_centers, base_R, base_t)
+
                 pts_world, cols = unproject_depth_to_world(
                     depth=depth,
                     rgb_u8=rgb_u8,
@@ -1068,6 +1291,19 @@ def main() -> None:
                 )
                 rr.log("world/points", rr.Points3D(pts_view, colors=col_view))
                 rr.log("world/camera_path", rr.LineStrips3D([cam_path]))
+                connection.publish_current_pos(cam_pos_base)
+                if det_points.size > 0:
+                    det_cols = np.full((det_points.shape[0], 3), [255, 0, 0], dtype=np.uint8)
+                    rr.log("world/detections/points", rr.Points3D(det_points, colors=det_cols))
+                if det_centers.size > 0:
+                    center_cols = np.full(
+                        (det_centers.shape[0], 3), [255, 255, 255], dtype=np.uint8
+                    )
+                    rr.log(
+                        "world/detections/centers",
+                        rr.Points3D(det_centers, colors=center_cols),
+                    )
+                    connection.publish_obj_points(det_centers)
                 if args.map2d_enable:
                     pts2d_view = (
                         map2d_pts[:map2d_filled]
@@ -1191,6 +1427,27 @@ def main() -> None:
                 pts_global = apply_sim3(pts_chunk, s_cum, R_cum, t_cum)
                 pts_global = apply_base_transform(pts_global, base_R, base_t)
 
+                det_points = np.zeros((0, 3), dtype=np.float32)
+                det_centers = np.zeros((0, 3), dtype=np.float32)
+                prompt = connection.pop_prompt()
+                if detect_fn is not None and prompt is not None:
+                    det_points, det_centers = detect_objects_to_world(
+                        detect_fn,
+                        rgb_u8,
+                        depth,
+                        K,
+                        c2w_chunk,
+                        prompt,
+                        stride=int(args.detect_stride),
+                        min_depth=float(args.min_depth),
+                        max_depth=float(args.max_depth),
+                        max_points=int(args.detect_max_points),
+                    )
+                    det_points = apply_sim3(det_points, s_cum, R_cum, t_cum)
+                    det_centers = apply_sim3(det_centers, s_cum, R_cum, t_cum)
+                    det_points = apply_base_transform(det_points, base_R, base_t)
+                    det_centers = apply_base_transform(det_centers, base_R, base_t)
+
                 reservoir_filled, reservoir_seen = reservoir_update(
                     pts_global,
                     cols,
@@ -1236,6 +1493,19 @@ def main() -> None:
                 )
                 rr.log("world/points", rr.Points3D(pts_view, colors=col_view))
                 rr.log("world/camera_path", rr.LineStrips3D([cam_path]))
+                connection.publish_current_pos(cam_pos_global)
+                if det_points.size > 0:
+                    det_cols = np.full((det_points.shape[0], 3), [255, 0, 0], dtype=np.uint8)
+                    rr.log("world/detections/points", rr.Points3D(det_points, colors=det_cols))
+                if det_centers.size > 0:
+                    center_cols = np.full(
+                        (det_centers.shape[0], 3), [255, 255, 255], dtype=np.uint8
+                    )
+                    rr.log(
+                        "world/detections/centers",
+                        rr.Points3D(det_centers, colors=center_cols),
+                    )
+                    connection.publish_obj_points(det_centers)
                 if args.map2d_enable:
                     pts2d_view = (
                         map2d_pts[:map2d_filled]
@@ -1277,7 +1547,7 @@ def main() -> None:
                 frame_buf = []
                 id_buf = []
     finally:
-        receiver.close()
+        connection.close()
 
 
 if __name__ == "__main__":
