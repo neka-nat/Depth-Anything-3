@@ -45,12 +45,6 @@ def parse_args() -> argparse.Namespace:
         description="Webcam → Depth Anything 3 → point cloud + camera path in Rerun."
     )
 
-    parser.add_argument(
-        "--mode",
-        choices=("chunk", "vo"),
-        default="chunk",
-        help="Mapping mode: 'chunk' (DA3 multi-view + overlap Sim3) or 'vo' (PnP-based).",
-    )
     parser.add_argument("--camera-index", type=int, default=0, help="cv2.VideoCapture index.")
     parser.add_argument(
         "--mirror",
@@ -120,7 +114,7 @@ def parse_args() -> argparse.Namespace:
         "--chunk-size",
         type=int,
         default=12,
-        help="Number of frames per DA3 multi-view inference (chunk mode).",
+        help="Number of frames per DA3 multi-view inference.",
     )
     parser.add_argument(
         "--overlap",
@@ -421,152 +415,6 @@ def unproject_depth_to_world(
     return pts_world.astype(np.float32), cols
 
 
-@dataclass
-class VoResult:
-    updated: bool
-    num_tracked: int
-    num_inliers: int
-    c2w: np.ndarray
-
-
-def estimate_pose_pnp(
-    prev_gray: np.ndarray,
-    curr_gray: np.ndarray,
-    prev_depth: np.ndarray,
-    prev_K: np.ndarray,
-    curr_K: np.ndarray,
-    prev_c2w: np.ndarray,
-    *,
-    max_features: int,
-    quality_level: float,
-    min_distance: int,
-    min_depth: float,
-    max_depth: float,
-    reproj_error: float,
-    min_inliers: int,
-) -> VoResult:
-    if prev_gray.ndim != 2 or curr_gray.ndim != 2:
-        raise ValueError("prev_gray and curr_gray must be grayscale (H,W).")
-
-    prev_pts = cv2.goodFeaturesToTrack(
-        prev_gray,
-        maxCorners=int(max_features),
-        qualityLevel=float(quality_level),
-        minDistance=float(min_distance),
-        blockSize=7,
-        useHarrisDetector=False,
-    )
-    if prev_pts is None or len(prev_pts) < max(6, min_inliers):
-        return VoResult(
-            updated=False, num_tracked=0, num_inliers=0, c2w=prev_c2w.astype(np.float32)
-        )
-
-    curr_pts, st, _err = cv2.calcOpticalFlowPyrLK(
-        prev_gray,
-        curr_gray,
-        prev_pts,
-        None,
-        winSize=(21, 21),
-        maxLevel=3,
-        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-    )
-
-    if curr_pts is None or st is None:
-        return VoResult(
-            updated=False, num_tracked=0, num_inliers=0, c2w=prev_c2w.astype(np.float32)
-        )
-
-    st = st.reshape(-1).astype(bool)
-    prev_uv = prev_pts.reshape(-1, 2)[st]
-    curr_uv = curr_pts.reshape(-1, 2)[st]
-
-    if prev_uv.shape[0] < max(6, min_inliers):
-        return VoResult(
-            updated=False,
-            num_tracked=int(prev_uv.shape[0]),
-            num_inliers=0,
-            c2w=prev_c2w.astype(np.float32),
-        )
-
-    H, W = prev_depth.shape
-    u = prev_uv[:, 0]
-    v = prev_uv[:, 1]
-    ui = np.rint(u).astype(np.int32)
-    vi = np.rint(v).astype(np.int32)
-
-    in_bounds = (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H)
-    ui = ui[in_bounds]
-    vi = vi[in_bounds]
-    prev_uv = prev_uv[in_bounds]
-    curr_uv = curr_uv[in_bounds]
-
-    if prev_uv.shape[0] < max(6, min_inliers):
-        return VoResult(
-            updated=False,
-            num_tracked=int(prev_uv.shape[0]),
-            num_inliers=0,
-            c2w=prev_c2w.astype(np.float32),
-        )
-
-    z = prev_depth[vi, ui].astype(np.float32)
-    depth_ok = np.isfinite(z) & (z > float(min_depth)) & (z < float(max_depth))
-    z = z[depth_ok]
-    prev_uv = prev_uv[depth_ok]
-    curr_uv = curr_uv[depth_ok]
-
-    if prev_uv.shape[0] < max(6, min_inliers):
-        return VoResult(
-            updated=False,
-            num_tracked=int(prev_uv.shape[0]),
-            num_inliers=0,
-            c2w=prev_c2w.astype(np.float32),
-        )
-
-    fx0, fy0, cx0, cy0 = (
-        float(prev_K[0, 0]),
-        float(prev_K[1, 1]),
-        float(prev_K[0, 2]),
-        float(prev_K[1, 2]),
-    )
-    X = (prev_uv[:, 0] - cx0) * z / fx0
-    Y = (prev_uv[:, 1] - cy0) * z / fy0
-    obj_pts = np.stack([X, Y, z], axis=-1).astype(np.float32)
-    img_pts = curr_uv.astype(np.float32)
-
-    ok, rvec, tvec, inliers = cv2.solvePnPRansac(
-        objectPoints=obj_pts,
-        imagePoints=img_pts,
-        cameraMatrix=curr_K.astype(np.float64),
-        distCoeffs=None,
-        reprojectionError=float(reproj_error),
-        iterationsCount=100,
-        confidence=0.999,
-        flags=cv2.SOLVEPNP_ITERATIVE,
-    )
-
-    num_inliers = int(len(inliers)) if inliers is not None else 0
-    if not ok or num_inliers < int(min_inliers):
-        return VoResult(
-            updated=False,
-            num_tracked=int(img_pts.shape[0]),
-            num_inliers=num_inliers,
-            c2w=prev_c2w.astype(np.float32),
-        )
-
-    R, _ = cv2.Rodrigues(rvec)
-    t = tvec.reshape(3)
-    T_prev_to_curr = np.eye(4, dtype=np.float32)
-    T_prev_to_curr[:3, :3] = R.astype(np.float32)
-    T_prev_to_curr[:3, 3] = t.astype(np.float32)
-
-    T_curr_to_prev = np.linalg.inv(T_prev_to_curr).astype(np.float32)
-    c2w = (prev_c2w @ T_curr_to_prev).astype(np.float32)
-
-    return VoResult(
-        updated=True, num_tracked=int(img_pts.shape[0]), num_inliers=num_inliers, c2w=c2w
-    )
-
-
 def _collect_overlap_correspondences(
     prev_pred,
     curr_pred,
@@ -755,10 +603,6 @@ def main() -> None:
         print(f"[ERROR] Could not open camera index {args.camera_index}", file=sys.stderr)
         raise SystemExit(1)
 
-    prev_gray = None
-    prev_depth = None
-    prev_K = None
-    c2w = np.eye(4, dtype=np.float32)
     cam_positions: list[np.ndarray] = []
 
     reservoir_pts = np.zeros((int(args.max_points), 3), dtype=np.float32)
@@ -785,121 +629,6 @@ def main() -> None:
             frame_bgr = resize_long_edge_bgr(frame_bgr, args.max_edge)
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-            if args.mode == "vo":
-                t0 = time.time()
-                pred = model.inference(
-                    [frame_rgb],
-                    process_res=args.process_res,
-                    process_res_method="upper_bound_resize",
-                    export_dir=None,
-                    export_format="mini_npz",
-                )
-                infer_ms = (time.time() - t0) * 1000.0
-
-                depth = pred.depth[0].astype(np.float32)
-                rgb_u8 = pred.processed_images[0].astype(np.uint8)
-                conf = pred.conf[0].astype(np.float32) if pred.conf is not None else None
-
-                K = pred.intrinsics[0].astype(np.float32) if pred.intrinsics is not None else None
-                if K is None:
-                    K = ensure_pinhole_from_size(depth.shape[0], depth.shape[1])
-
-                gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY)
-
-                vo = None
-                if (
-                    not args.no_vo
-                    and prev_gray is not None
-                    and prev_depth is not None
-                    and prev_K is not None
-                ):
-                    vo = estimate_pose_pnp(
-                        prev_gray=prev_gray,
-                        curr_gray=gray,
-                        prev_depth=prev_depth,
-                        prev_K=prev_K,
-                        curr_K=K,
-                        prev_c2w=c2w,
-                        max_features=args.max_features,
-                        quality_level=args.quality_level,
-                        min_distance=args.min_distance,
-                        min_depth=args.min_depth,
-                        max_depth=args.max_depth,
-                        reproj_error=args.pnp_reproj_error,
-                        min_inliers=args.min_inliers,
-                    )
-                    c2w = vo.c2w
-
-                pts_world, cols = unproject_depth_to_world(
-                    depth=depth,
-                    rgb_u8=rgb_u8,
-                    K=K,
-                    c2w=c2w,
-                    stride=args.stride,
-                    min_depth=args.min_depth,
-                    max_depth=args.max_depth,
-                    conf=conf,
-                    conf_threshold=args.conf_threshold,
-                )
-
-                reservoir_filled, reservoir_seen = reservoir_update(
-                    pts_world,
-                    cols,
-                    reservoir_pts=reservoir_pts,
-                    reservoir_cols=reservoir_cols,
-                    filled=reservoir_filled,
-                    seen=reservoir_seen,
-                )
-
-                cam_positions.append(c2w[:3, 3].copy())
-                cam_path = np.asarray(cam_positions, dtype=np.float32)
-
-                try:
-                    rr.set_time_sequence("frame", frame_idx)
-                except Exception:
-                    pass
-
-                pts_view = (
-                    reservoir_pts[:reservoir_filled]
-                    if reservoir_filled < reservoir_pts.shape[0]
-                    else reservoir_pts
-                )
-                col_view = (
-                    reservoir_cols[:reservoir_filled]
-                    if reservoir_filled < reservoir_cols.shape[0]
-                    else reservoir_cols
-                )
-                rr.log("world/points", rr.Points3D(pts_view, colors=col_view))
-                rr.log("world/camera_path", rr.LineStrips3D([cam_path]))
-
-                try:
-                    rr.log("world/rgb", rr.Image(rgb_u8))
-                except Exception:
-                    pass
-                try:
-                    rr.log("world/depth", rr.DepthImage(depth))
-                except Exception:
-                    pass
-                try:
-                    if vo is not None:
-                        rr.log(
-                            "world/stats",
-                            rr.TextLog(
-                                f"infer={infer_ms:.1f}ms, tracked={vo.num_tracked}, inliers={vo.num_inliers}"
-                            ),
-                        )
-                    else:
-                        rr.log("world/stats", rr.TextLog(f"infer={infer_ms:.1f}ms"))
-                except Exception:
-                    pass
-
-                frame_idx += 1
-                prev_gray = gray
-                prev_depth = depth
-                prev_K = K
-                continue
-
-            # --- chunk mode ---
             frame_buf.append(frame_rgb)
             id_buf.append(frame_idx)
             frame_idx += 1
@@ -919,7 +648,7 @@ def main() -> None:
             infer_ms = (time.time() - t0) * 1000.0
 
             if pred.extrinsics is None or pred.intrinsics is None:
-                print("[ERROR] Model did not return camera parameters; use --mode vo.", file=sys.stderr)
+                print("[ERROR] Model did not return camera parameters.", file=sys.stderr)
                 break
 
             num_corr = 0

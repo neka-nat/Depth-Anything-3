@@ -79,6 +79,17 @@ mkdir ./extract_images
 ffmpeg -i your_video.mp4 -vf "fps=5,scale=640:-1" ./extract_images/frame_%06d.png
 ```
 
+#### Extra scripts
+
+```cmd
+uv run python da3_webcam_rerun.py --camera-index 0 --spawn
+```
+
+```cmd
+uv run python da3_zenoh_rerun.py --map2d-enable --spawn --detect-enable
+```
+
+
 
 ### 4 - Outputs
 
